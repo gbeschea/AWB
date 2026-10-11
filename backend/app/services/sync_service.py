@@ -594,12 +594,23 @@ async def sync_orders(
                                     # populated list/string refreshes them.
                                     existing.tags = parsed.get("tags") or existing.tags
                                     existing.note = parsed.get("note") or existing.note
-                                    existing.synced_at = datetime.utcnow()
-                                    updated_count += 1
-                                    org_updated += 1
-                                    batch_updated += 1
+                                    # Only stamp synced_at when something ELSE actually
+                                    # changed. Stamping unconditionally made every row
+                                    # dirty on every pass, so the 7d/30d tiers physically
+                                    # rewrote every recent order dozens of times a day
+                                    # (~1 KB line_items each) - 145k UPDATEs / 10 min on
+                                    # 738k rows. The dead copies could never be returned
+                                    # to the OS: orders reached 94 GB for 1 GB of live
+                                    # data, filled the disk, and Postgres went down
+                                    # (2026-08-24). An unchanged order is now a no-op,
+                                    # and the "updated" counters mean what they say.
+                                    if db.is_modified(existing):
+                                        existing.synced_at = datetime.utcnow()
+                                        updated_count += 1
+                                        org_updated += 1
+                                        batch_updated += 1
+                                        per_store_stats[store_uid]["updated"] += 1
                                     order_obj = existing
-                                    per_store_stats[store_uid]["updated"] += 1
                                 else:
                                     # ── CREATE new order ──
                                     order_obj = Order(
