@@ -161,6 +161,7 @@ async def fetch_ledger(occurred_from: str, chunks: int = 8) -> List[dict]:
         seen.add(e.get("id"))
         out.append(
             {
+                "id": e.get("id"),
                 "master": e["masterProductId"],
                 "at": e["occurredAt"],
                 "created": e.get("createdAt") or "",
@@ -171,3 +172,17 @@ async def fetch_ledger(occurred_from: str, chunks: int = 8) -> List[dict]:
             }
         )
     return out
+
+
+async def fetch_master_ledger(master_id: str, limit: int = 60) -> List[dict]:
+    """Istoricul de stoc al UNUI master: fiecare mișcare, cu motiv, notă și cine a făcut-o.
+
+    E singurul loc unde se vede DE CE s-a schimbat stocul — recepție, inventar, corecție
+    manuală, reconciliere din magazin. Exact lanțul care a scos la iveală masterii duplicat
+    cu stoc fantomă (600 de draperii scrise pe un master arhivat).
+    """
+    async with httpx.AsyncClient(
+        base_url=settings.stock_sync_api_url, timeout=30.0
+    ) as client:
+        data = await _get(client, f"/v1/master-products/{master_id}/ledger", {"limit": limit})
+        return data.get("entries") or []

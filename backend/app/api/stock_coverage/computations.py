@@ -15,7 +15,7 @@ reads straight off the table.
 
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -29,6 +29,8 @@ BUCHAREST = ZoneInfo("Europe/Bucharest")
 SOON_DAYS = 14
 SLOW_DAYS = 180
 VERY_SLOW_DAYS = 365
+# "Surplus": what is still unsold after this long at today's pace (= the "lent" line).
+SURPLUS_DAYS = SLOW_DAYS
 # Dead stock: nothing sold for this long, whatever period the page is showing
 # (same 90-day rule as the team's produse-fara-ads "MORT" verdict).
 DEAD_DAYS = 90
@@ -39,24 +41,46 @@ STALE_STORE_DAYS = 7
 LEDGER_SEEDING_END = "2026-07-27"
 
 # Perfumes are out of scope for this report.
-PERFUME_STORE_NAMES = {"esteban.ro", "georgetalent.ro", "nubra", "labnoir.ro"}
+PERFUME_STORE_NAMES = {"esteban.ro", "georgetalent.ro", "nubra", "labnoir.ro", "duppo.md"}
 PERFUME_NAME_RE = re.compile(
-    r"inspired by|inspirat (de|din)|\bparfum|\bperfume|eau de (parfum|toilette)"
-    r"|\bzeylin\b|l'essence|\bessence no\b|^no\. ?\d+\b",
+    # "parfum" only leading or as "apă de parfum": "Sita Odorizanta …, Parfum 45 Zile"
+    # is a urinal screen, not a perfume.
+    r"inspired by|inspirat (de|din)|^parfum\b|ap[aă] de parfum|\bperfume"
+    r"|eau de (parfum|toilette)|\bzeylin\b|l'essence|\bessence no\b|^no\. ?\d+\b",
     re.IGNORECASE,
 )
 # Placeholder SKUs (seeded "infinite" stock) — excluded like in produse-fara-ads.
 PLACEHOLDER_SKU_RE = re.compile(r"surpriza|mystery|cutie-cadou|^test", re.IGNORECASE)
 NEGATIVE_STATUSES = {"mort", "nu_se_vinde", "lent", "foarte_lent"}
 YEAR_DAYS = 365
-# Goods arriving = a supplier delivery or container intake, told apart by the ledger
-# note: "recepție livrare …", "recuperare stoc livrare …" (delivery lines re-booked)
-# and "Receptie container C55" (booked as a CORRECTION). Neither the reason nor a
-# 0 → stock jump is enough: inventory counts, scanner adjustments ("ajustare stoc din
-# scaner") and moves between warehouses also do that to old stock.
-RECEIPT_NOTE_RE = re.compile(r"recep[tț]i|recuperare stoc livrare", re.IGNORECASE)
-NOT_RECEIPT_NOTE_RE = re.compile(r"scaner|mutare", re.IGNORECASE)
+# Goods arriving (Gigi's review): a receipt (RECEIVING, or a note saying "recepție" /
+# "livrare") or ANY stock going from 0 to N — the real C54-C56 goods were booked on
+# 23.09 as "Inventar" — net of the manual corrections that undo it within 48 hours
+# (C55/C56 were booked at 11:27 on 24.09 and cancelled at 12:00 as double counting).
+# Only the arrived units are "nou": the stock already there keeps its verdict, and
+# goods that haven't sold for NEW_GOODS_GRACE_DAYS after arriving are judged as usual.
 MIN_RECEIPT_UNITS = 10
+ARRIVAL_UNDO_HOURS = 48
+NEW_GOODS_GRACE_DAYS = 21
+RECEIPT_NOTE_RE = re.compile(r"recep[tț]i|livrare", re.IGNORECASE)
+NOT_RECEIPT_NOTE_RE = re.compile(
+    r"scaner|mutare|mutat|corec[tț]i|dubl[aă]|anulat|revert|undo", re.IGNORECASE
+)
+RECONCILIATION_NOTE_RE = re.compile(r"daily reconciliation", re.IGNORECASE)
+# sku_costs placeholder value (80 products carry exactly 10,00): not a real cost.
+FILLER_COST = 10.0
+# stock-sync went live on 21.07; its ledger is the only record of stock being confirmed.
+LEDGER_CUTOVER = "2026-07-21"
+# A stock is "counted" once someone physically confirmed it after the cutover — a receipt,
+# an inventory count, a scan or a shelf count. Otherwise it is just the figure a store's
+# Shopify holds (ROSSI Nails: never counted), and the report keeps
+# it out of every total.
+PHYSICAL_NOTE_RE = re.compile(
+    r"inventar|recep[tț]i|livrare|container|scaner|num[aă]rat|fizic|raft|aliniat",
+    re.IGNORECASE,
+)
+# Moving a pile between warehouses confirms nothing about the quantity.
+MOVE_NOTE_RE = re.compile(r"mutare|mutat", re.IGNORECASE)
 # A listing waiting in stock-sync's relink review is live on its store but not linked
 # to its master yet — a different fix from "listed nowhere".
 PENDING_LINK_STATUSES = {"PENDING_RELINK_REVIEW", "NO_MASTER_MATCH"}
@@ -153,30 +177,90 @@ def stock_status(
     return "ok"
 
 
-def _is_arrival(e: dict) -> bool:
-    note = e.get("note") or ""
-    return (
-        e["after"] - e["before"] >= MIN_RECEIPT_UNITS
-        and bool(RECEIPT_NOTE_RE.search(note))
-        and not NOT_RECEIPT_NOTE_RE.search(note)
-    )
+def physically_counted(ledger: Iterable[dict]) -> set:
+    """Masters whose stock was physically confirmed at least once since the cutover."""
+    return {
+        e["master"]
+        for e in ledger
+        if e.get("reason") == "RECEIVING"
+        or (
+            PHYSICAL_NOTE_RE.search(e.get("note") or "")
+            and not MOVE_NOTE_RE.search(e.get("note") or "")
+        )
+    }
 
 
-def stock_arrivals(ledger: Iterable[dict]) -> Dict[str, datetime]:
-    """master → last supplier delivery / container intake, ignoring the opening-stock
-    seeding at the stock-sync cutover."""
-    arrivals: Dict[str, str] = {}
-    for e in sorted(ledger, key=lambda x: (x["at"], x["created"])):
-        if e["at"] >= LEDGER_SEEDING_END and _is_arrival(e):
-            arrivals[e["master"]] = e["at"]
-    out = {}
-    for master, at in arrivals.items():
-        try:
-            out[master] = datetime.fromisoformat(at.replace("Z", "+00:00")).replace(
-                tzinfo=None
-            )
-        except ValueError:
-            continue
+def _parse_at(at: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(at.replace("Z", "+00:00")).replace(tzinfo=None)
+    except (ValueError, AttributeError):
+        return None
+
+
+def stock_arrivals(ledger: Iterable[dict]) -> Dict[str, dict]:
+    """master → its last arrival of goods since the cutover:
+    {"at": when, "units": net units that arrived, "before": stock it already had}."""
+    by_master: Dict[str, list] = defaultdict(list)
+    for e in ledger:
+        at = _parse_at(e["at"])
+        if at:
+            by_master[e["master"]].append((at, e))
+    undo_window = timedelta(hours=ARRIVAL_UNDO_HOURS)
+    out: Dict[str, dict] = {}
+    for master, entries in by_master.items():
+        entries.sort(key=lambda x: (x[1]["at"], x[1]["created"]))
+        for i, (at, e) in enumerate(entries):
+            note = e.get("note") or ""
+            received = e["after"] - e["before"]
+            if (
+                e["at"] < LEDGER_SEEDING_END
+                or received < MIN_RECEIPT_UNITS
+                or RECONCILIATION_NOTE_RE.search(note)
+            ):
+                continue
+            is_receipt = (
+                e.get("reason") == "RECEIVING" or RECEIPT_NOTE_RE.search(note)
+            ) and not NOT_RECEIPT_NOTE_RE.search(note)
+            if not (e["before"] <= 0 or is_receipt):
+                continue
+            undone = 0.0
+            for later_at, later in entries[i + 1 :]:
+                if later_at - at > undo_window:
+                    break
+                if (
+                    later.get("reason") == "CORRECTION"
+                    and later["after"] < later["before"]
+                    and not RECONCILIATION_NOTE_RE.search(later.get("note") or "")
+                ):
+                    undone += later["before"] - later["after"]
+            if received - undone >= MIN_RECEIPT_UNITS:
+                out[master] = {
+                    "at": at,
+                    "units": received - undone,
+                    "before": max(e["before"], 0),
+                }
+    return out
+
+
+def pick_shopify_costs(variants: Iterable[Tuple[str, float, object]]) -> Dict[str, float]:
+    """barcode → cost from (barcode, costPerItem, updated_at) of the RON stores' variants.
+
+    The same product can carry different costs on different stores (set-10-lavete-sarma:
+    2,49 on three, 2,14 on one): take the most common, then the most recently updated.
+    """
+    by_barcode: Dict[str, list] = defaultdict(list)
+    for barcode, cost, updated in variants:
+        if barcode and cost and cost > 0:
+            by_barcode[barcode.strip()].append((round(float(cost), 4), updated))
+    out: Dict[str, float] = {}
+    for barcode, entries in by_barcode.items():
+        counts: Dict[float, int] = defaultdict(int)
+        latest: Dict[float, object] = {}
+        for cost, updated in entries:
+            counts[cost] += 1
+            if updated is not None and (cost not in latest or str(updated) > str(latest[cost])):
+                latest[cost] = updated
+        out[barcode] = max(counts, key=lambda c: (counts[c], str(latest.get(c) or "")))
     return out
 
 
@@ -191,26 +275,37 @@ def build_rows(
     now: Optional[datetime] = None,
     first_seen: Optional[Dict[str, datetime]] = None,
     store_first_order: Optional[Dict[str, datetime]] = None,
-    arrivals: Optional[Dict[str, datetime]] = None,
+    arrivals: Optional[Dict[str, dict]] = None,
+    counted: Optional[set] = None,
     test_skus: Optional[set] = None,
     store_last_order: Optional[Dict[str, datetime]] = None,
     year_sales: Optional[Dict[Tuple[str, str], float]] = None,
+    sale_days: Optional[Dict[Tuple[str, str], set]] = None,
+    shopify_costs: Optional[Dict[str, float]] = None,
+    vat_rate: float = 0.0,
 ) -> dict:
     """Build every report row (per store, unallocated, all stores); filtering happens later.
 
     awb_catalog: (awb_store_uid, sku, barcode, title) for active AWB products — used
         for stores stock-sync doesn't manage, and as a name / SKU fallback.
-    sales: (awb_store_uid, sku) → {"units", "name", "first_day"} in the period —
-        cancelled orders excluded, first_day = first sale day in the period (Bucharest),
-        the same rules as the "Viteză Vânzări" report.
+    sales: (awb_store_uid, sku) → {"units", "net_units", "name"} in the period —
+        cancelled, refused and returned parcels excluded; net_units also discounts the
+        parcels still on their way by the store's refusal rate (the velocity uses it).
     last_sales: (awb_store_uid, sku) → last non-cancelled order date (naive UTC).
-    costs: sku → unit cost in RON.
+    costs: sku → unit cost in RON from sku_costs — only a fallback.
+    shopify_costs: barcode → Shopify costPerItem in RON — the cost used first.
+    vat_rate: both costs are WITH VAT — ARONA's COGS formula ends in × 1.21
+        (gigi:cogs-audit, sheet "Stoc ARONA" → "COGS 2026") and the profit engine
+        divides it back; the stock value is reported without VAT.
+    sale_days: (awb_store_uid, sku) → days with a sale, to tell a restock from new goods.
     first_seen: sku → when the product first appeared in the AWB catalog.
     store_first_order: awb store uid → its first order (a new store has no history).
     year_sales: (awb_store_uid, sku) → units over the last year, for the "runs out in"
         estimate of products that sold nothing in the period.
     """
     year_sales = year_sales or {}
+    sale_days = sale_days or {}
+    shopify_costs = shopify_costs or {}
     first_seen = first_seen or {}
     store_first_order = store_first_order or {}
     arrivals = arrivals or {}
@@ -305,8 +400,9 @@ def build_rows(
 
     # Keyed by (awb store, master or "sku:<sku>"); pooled figures keyed by master.
     store_sold: Dict[Tuple[str, str], float] = defaultdict(float)
-    store_first: Dict[Tuple[str, str], object] = {}
-    pool_first: Dict[str, object] = {}
+    store_net: Dict[Tuple[str, str], float] = defaultdict(float)
+    pool_net: Dict[str, float] = defaultdict(float)
+    master_sale_days: Dict[str, set] = defaultdict(set)
     store_skus: Dict[Tuple[str, str], set] = defaultdict(set)
     store_last: Dict[Tuple[str, str], datetime] = {}
     pool_sold: Dict[str, float] = defaultdict(float)
@@ -315,17 +411,19 @@ def build_rows(
     for (store_uid, sku), agg in sales.items():
         master = resolve_master(store_uid, sku)
         key = (store_uid, master or f"sku:{sku}")
+        net = agg.get("net_units", agg["units"])
         store_sold[key] += agg["units"]
+        store_net[key] += net
         store_skus[key].add(sku)
-        first = agg.get("first_day")
-        if first and (key not in store_first or first < store_first[key]):
-            store_first[key] = first
         if master:
             pool_sold[master] += agg["units"]
-            if first and (master not in pool_first or first < pool_first[master]):
-                pool_first[master] = first
+            pool_net[master] += net
         if agg.get("name") and sku not in sale_name:
             sale_name[sku] = agg["name"]
+    for (store_uid, sku), days in sale_days.items():
+        master = resolve_master(store_uid, sku)
+        if master:
+            master_sale_days[master] |= days
     store_year: Dict[Tuple[str, str], float] = defaultdict(float)
     pool_year: Dict[str, float] = defaultdict(float)
     for (store_uid, sku), units in year_sales.items():
@@ -364,6 +462,15 @@ def build_rows(
         sku_owners[sku].add(master)
 
     def unit_cost(master: Optional[str], skus: Iterable[str]) -> Optional[float]:
+        cost = cost_with_vat(master, skus)
+        return cost / (1 + vat_rate) if cost else None
+
+    def cost_with_vat(master: Optional[str], skus: Iterable[str]) -> Optional[float]:
+        if master:
+            for source in (stock_by_master.get(master), master_info.get(master)):
+                for bc in ((source or {}).get("barcode"), (source or {}).get("barcodeNormalized")):
+                    if bc and shopify_costs.get(bc.strip()):
+                        return shopify_costs[bc.strip()]
         candidates = sorted(skus)
         if master:
             candidates += sorted(
@@ -372,7 +479,7 @@ def build_rows(
             )
             candidates.sort(key=lambda sku: sku_owners.get(sku, {master}) != {master})
         for sku in candidates:
-            if costs.get(sku):
+            if costs.get(sku) and costs[sku] != FILLER_COST:
                 return costs[sku]
         return None
 
@@ -444,25 +551,46 @@ def build_rows(
         pooled: float,
         last_sale: Optional[datetime],
         year_sold: float = 0.0,
-        first_sale_day=None,
+        net_sold: Optional[float] = None,
         stock_is_pool: bool = False,
     ) -> dict:
         stock = stock_by_master.get(master) if master else None
         age = product_age(master, skus)
         history = history_days(store_uid, age)
         listed = master is None or master in listed_masters
-        arrived = arrivals.get(master) if master else None
+        arrival = arrivals.get(master) if master else None
+        arrived = arrival["at"] if arrival else None
+        # None = no ledger given (tests, or stock-sync ledger unavailable): don't flag.
+        uncounted = bool(
+            counted is not None
+            and master
+            and stock_units
+            and stock_units > 0
+            and master not in counted
+        )
         arrived_days = (today - _bucharest_date(arrived)).days if arrived else None
+        fresh_goods = False
+        old_share = 1.0
+        if arrived_days is not None and arrived_days < DEAD_DAYS:
+            arrived_on = _bucharest_date(arrived)
+            sold_since = any(d >= arrived_on for d in master_sale_days.get(master, ()))
+            fresh_goods = arrived_days < NEW_GOODS_GRACE_DAYS or sold_since
+            # Old stock = what the product holds beyond the units that arrived (later
+            # recounts can add to it); a store row holds the same share of it.
+            total = (stock or {}).get("totalUnits") or 0
+            old_share = max(0.0, total - arrival["units"]) / total if total > 0 else 0.0
         velocity_basis = None
-        velocity_days = period_days
+        # The whole period, unless the product or the store is younger than it, or its
+        # goods arrived from zero stock within it (it couldn't sell before).
+        velocity_days = (
+            period_days
+            if history is None
+            else max(1, min(period_days, history + 1))
+        )
+        if arrival and arrival["before"] <= 0 and arrived_days is not None:
+            velocity_days = max(1, min(velocity_days, arrived_days + 1))
         if sold:
-            # As in "Viteză Vânzări": a product first sold mid-period is divided only by
-            # the days since that first sale, so a fresh launch isn't read as slow.
-            if first_sale_day:
-                velocity_days = max(
-                    1, min(period_days, (today - first_sale_day).days + 1)
-                )
-            velocity = sold / velocity_days
+            velocity = (sold if net_sold is None else net_sold) / velocity_days
             velocity_basis = "perioada"
         elif year_sold:
             # Nothing sold in the period: the last year's pace still says how long the
@@ -472,7 +600,10 @@ def build_rows(
         else:
             velocity = 0.0
         coverage = _safe_div(stock_units, velocity) if stock_units is not None else None
-        cost = unit_cost(master, skus)
+        # A product not linked to its master yet is still costed by its store SKU.
+        cost = unit_cost(
+            master, skus or (unlinked_skus.get(master, set()) if master else set())
+        )
         days_since = (today - _bucharest_date(last_sale)).days if last_sale else None
         status = stock_status(
             stock_units, sold, coverage if sold else None, days_since, history, listed
@@ -481,12 +612,26 @@ def build_rows(
             if store_uid in stale_stores:
                 # No orders for a week: sales history isn't reliable, don't judge.
                 status = "date_incomplete"
-            elif (arrived_days is not None and arrived_days < DEAD_DAYS) or (
-                age is not None and age < DEAD_DAYS
-            ):
-                # Goods delivered recently, or a product launched recently: too early
-                # to call it dead or slow.
+            elif age is not None and age < DEAD_DAYS:
+                # A product launched recently: too early to call it dead or slow.
                 status = "nou"
+            elif fresh_goods:
+                # The arrived units are too new to judge; the stock that was already
+                # there keeps its verdict.
+                old_units = (stock_units or 0) * old_share
+                old_status = (
+                    stock_status(
+                        old_units,
+                        sold,
+                        _safe_div(old_units, velocity) if sold else None,
+                        days_since,
+                        history,
+                        listed,
+                    )
+                    if old_units >= MIN_RECEIPT_UNITS
+                    else None
+                )
+                status = old_status if old_status in NEGATIVE_STATUSES else "nou"
         listing_note = None
         if master and not listed:
             if pending_link.get(master):
@@ -501,6 +646,14 @@ def build_rows(
         value = (
             stock_units * cost if (cost and stock_units and stock_units > 0) else None
         )
+        surplus_units = (
+            max(0, round(stock_units - velocity * SURPLUS_DAYS))
+            if stock_units and stock_units > 0
+            else None
+        )
+        surplus_value = surplus_units * cost if (cost and surplus_units) else None
+        if cost and surplus_units == 0:
+            surplus_value = 0.0
         return {
             "store_uid": store_uid,
             "store_name": store_name,
@@ -527,8 +680,14 @@ def build_rows(
             "days_since_last_sale": days_since,
             "unit_cost": cost,
             "stock_value": round(value, 2) if value is not None else None,
+            "stock_uncounted": uncounted,
+            "surplus_units": surplus_units,
+            "surplus_value": round(surplus_value, 2)
+            if surplus_value is not None
+            else None,
             "status": status,
             "arrived_at": arrived.isoformat() if arrived else None,
+            "arrived_units": round(arrival["units"]) if arrival else None,
             "days_since_arrival": arrived_days,
             "history_days": history,
             "product_age_days": age,
@@ -582,7 +741,7 @@ def build_rows(
                         pooled,
                         store_last.get((uid, master)),
                         store_year.get((uid, master), 0.0),
-                        store_first.get((uid, master)),
+                        store_net.get((uid, master), 0.0),
                     )
                 )
             else:
@@ -598,7 +757,7 @@ def build_rows(
                     pooled,
                     pool_last.get(master),
                     pool_year.get(master, 0.0),
-                    pool_first.get(master),
+                    pool_net.get(master, 0.0),
                     stock_is_pool=True,
                 )
                 row["store_sold_units"] = round(store_sold.get((uid, master), 0.0), 2)
@@ -621,7 +780,7 @@ def build_rows(
                         0.0,
                         store_last.get((store_uid, key)),
                         store_year.get((store_uid, key), 0.0),
-                        store_first.get((store_uid, key)),
+                        store_net.get((store_uid, key), 0.0),
                     )
                 )
 
@@ -633,21 +792,24 @@ def build_rows(
         skus = set(
             master_skus.get(master) or catalog_skus_by_master.get(master) or set()
         )
-        if total > 0 or pooled > 0:
-            rows.append(
-                make_row(
-                    ALL_STORES_UID,
-                    ALL_STORES_NAME,
-                    master,
-                    skus,
-                    total,
-                    pooled,
-                    pooled,
-                    pool_last.get(master),
-                    pool_year.get(master, 0.0),
-                    pool_first.get(master),
-                )
+        # Produsele ajunse la 0 rămân în listă. Înainte ieșeau din raport (`total > 0 or
+        # pooled > 0`), deci nu se puteau nici căuta, nici deschide ca să le vezi mișcările —
+        # exact ce-ți trebuie când întrebi „ce s-a întâmplat cu marfa asta". Au status
+        # `fara_stoc`, deci nu intră în nicio valoare și stau la coada sortării implicite.
+        rows.append(
+            make_row(
+                ALL_STORES_UID,
+                ALL_STORES_NAME,
+                master,
+                skus,
+                total,
+                pooled,
+                pooled,
+                pool_last.get(master),
+                pool_year.get(master, 0.0),
+                pool_net.get(master, 0.0),
             )
+        )
         allocated = sum(
             (s.get("allocatedUnits") or 0) for s in stock.get("stores") or []
         )
@@ -664,7 +826,7 @@ def build_rows(
                     pooled,
                     pool_last.get(master),
                     pool_year.get(master, 0.0),
-                    pool_first.get(master),
+                    pool_net.get(master, 0.0),
                 )
             )
 
