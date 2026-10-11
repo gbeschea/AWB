@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.sku_risk.computations import compute_final_outcome
 from app.api.stock_coverage.ads_tiers import annotate as annotate_ads
+from app.api.stock_coverage.categories import categorize
 from app.api.stock_coverage.computations import (
     ALL_STORES_NAME,
     ALL_STORES_UID,
@@ -69,6 +70,11 @@ MIN_UNITS_FOR_STORE_REFUSAL_RATE = 50
 COSTS_TTL_SECONDS = 3600
 COST_SNAPSHOT = Path(__file__).resolve().parents[3] / "data" / "stock-coverage-costs.json"
 NO_CATEGORY = "Fără categorie"
+# A product with no category anywhere that no store sells and that holds no stock: an
+# old catalog row, kept for its history.
+DELISTED_CATEGORY = "Scos din vânzare"
+# The warehouse's own fallback word: means "it couldn't tell", so our rules get a go.
+WAREHOUSE_UNKNOWN = "Diverse"
 CATEGORIES_TTL_SECONDS = 3600
 # Fallback when this server has no warehouse login: a {generated_at, by_sku} snapshot
 # of the shelf list, dropped on the server (not in git).
@@ -566,12 +572,22 @@ def _row_key(row: dict) -> tuple:
     return (row["store_uid"], row["master_product_id"] or f"sku:{row['sku']}")
 
 
-def _row_category(row: dict, categories: dict) -> str:
-    for sku in (row["sku"] or "").split(","):
-        category = categories.get(sku.strip().lower())
-        if category:
+def _row_category(row: dict, categories: dict, stores_by_master: dict) -> str:
+    """The warehouse's category for the SKU (shelf products); else the same taxonomy
+    from the SKU code, the stores the product sells on, then its name."""
+    skus = [s.strip().lower() for s in (row["sku"] or "").split(",") if s.strip()]
+    for sku in skus:
+        category = categories.get(sku)
+        if category and category != WAREHOUSE_UNKNOWN:
             return category
-    return NO_CATEGORY
+    category = categorize(
+        skus,
+        stores_by_master.get(row["master_product_id"]) or (),
+        row.get("product_name") or "",
+    )
+    if category:
+        return category
+    return DELISTED_CATEGORY if (row.get("stock") or 0) <= 0 else NO_CATEGORY
 
 
 async def _build_combined() -> dict:
@@ -615,13 +631,20 @@ async def _build_combined() -> dict:
 def merge_periods(current_rows: list, long_rows: list, categories: dict) -> list:
     """The 30-day rows with the 90-day sales next to them, and each row's category."""
     long_by_key = {_row_key(r): r for r in long_rows}
+    stores_by_master: dict = defaultdict(set)
+    for r in (*current_rows, *long_rows):
+        if r["master_product_id"] and r["store_uid"] not in (
+            ALL_STORES_UID,
+            UNALLOCATED_STORE_UID,
+        ):
+            stores_by_master[r["master_product_id"]].add(r["store_name"])
     rows = []
     for r in current_rows:
         long_row = long_by_key.get(_row_key(r)) or {}
         row = {
             **r,
             "sold_units_90": long_row.get("sold_units", 0.0),
-            "category": _row_category(r, categories),
+            "category": _row_category(r, categories, stores_by_master),
         }
         if not r["sold_units"] and long_row.get("sold_units"):
             # Nothing in 30 days but sold in 90: the 90-day pace says how long it lasts.
@@ -646,7 +669,7 @@ def merge_periods(current_rows: list, long_rows: list, categories: dict) -> list
                     "sold_units": 0.0,
                     "sold_units_90": long_row["sold_units"],
                     "velocity_basis": "90",
-                    "category": _row_category(long_row, categories),
+                    "category": _row_category(long_row, categories, stores_by_master),
                 }
             )
     return rows

@@ -24,9 +24,17 @@ class WarehouseUnavailable(Exception):
 
 async def fetch_categories() -> Dict[str, str]:
     """SKU (lower-case) → warehouse category, for every product on a shelf."""
-    if not (settings.warehouse_api_user and settings.warehouse_api_password):
+    user, password = settings.warehouse_api_user, settings.warehouse_api_password
+    if not (user and password):
+        # Same service account the Warehouse page already uses (scan_service.json):
+        # without it the categories froze on the 24.09 snapshot.
+        from app.services.warehouse_service import _creds
+
+        creds = _creds()
+        user, password = creds.get("username"), creds.get("password")
+    if not (user and password):
         raise WarehouseUnavailable(
-            "WAREHOUSE_API_USER / WAREHOUSE_API_PASSWORD nu sunt setate în .env"
+            "Nici WAREHOUSE_API_USER / WAREHOUSE_API_PASSWORD în .env, nici scan_service.json"
         )
     try:
         async with httpx.AsyncClient(
@@ -34,10 +42,7 @@ async def fetch_categories() -> Dict[str, str]:
         ) as client:
             resp = await client.post(
                 "/api/auth/login",
-                json={
-                    "username": settings.warehouse_api_user,
-                    "password": settings.warehouse_api_password,
-                },
+                json={"username": user, "password": password},
             )
             token = resp.json().get("access_token") if resp.status_code == 200 else None
             if not token:
