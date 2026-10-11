@@ -24,6 +24,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.sku_risk.computations import compute_final_outcome
+from app.api.stock_coverage.ads_tiers import annotate as annotate_ads
 from app.api.stock_coverage.computations import (
     ALL_STORES_NAME,
     ALL_STORES_UID,
@@ -88,6 +89,16 @@ SALES_TTL_SECONDS = 600
 LAST_SALES_TTL_SECONDS = 1800
 LEDGER_TTL_SECONDS = 1800
 LAST_SALE_LOOKBACK_DAYS = 365
+# Ad spend per product for the ads tiers: the same 30 days as the sales next to it,
+# whole days only (today is still filling in).
+AD_SPEND_DAYS = CURRENT_DAYS
+AD_SPEND_TTL_SECONDS = 3600
+AD_SPEND_SQL = (
+    "SELECT sku, platform, SUM(spend_ron)::float8, MAX(date) "
+    "FROM cache.product_ad_spend "
+    "WHERE date >= CURRENT_DATE - $1::int AND date < CURRENT_DATE AND spend_ron > 0 "
+    "GROUP BY sku, platform"
+)
 
 _CACHE: dict = {}
 _LOCKS: dict = {}
@@ -433,6 +444,29 @@ async def _load_shopify_costs() -> dict:
     return {}
 
 
+async def _load_ad_spend() -> dict:
+    """(sku or product group, platform, RON) over the last AD_SPEND_DAYS whole days from
+    the metrics warehouse; {} without it (the page then shows no spend, tiers still work)."""
+    if not settings.metrics_database_url:
+        return {}
+    try:
+        import asyncpg
+
+        conn = await asyncpg.connect(settings.metrics_database_url, timeout=20)
+        try:
+            rows = await conn.fetch(AD_SPEND_SQL, AD_SPEND_DAYS)
+        finally:
+            await conn.close()
+    except Exception as e:
+        logger.warning("stock-coverage: ad spend unavailable: %s", e)
+        return {}
+    last = max((r[3] for r in rows if r[3]), default=None)
+    return {
+        "rows": [(r[0], r[1], r[2]) for r in rows],
+        "last_day": last.isoformat() if last else None,
+    }
+
+
 async def _build_report(days: int) -> dict:
     # Own sessions throughout: this also runs as a background refresh after the
     # request that triggered it is gone.
@@ -556,6 +590,8 @@ async def _build_combined() -> dict:
     )
     categories = category_source.get("by_sku") or {}
     rows = merge_periods(current["rows"], long["rows"], categories)
+    ad_spend = await _cached("ad-spend", AD_SPEND_TTL_SECONDS, _load_ad_spend)
+    ad_summary = annotate_ads(rows, ad_spend.get("rows") or [])
     return {
         **current,
         "rows": rows,
@@ -566,6 +602,12 @@ async def _build_combined() -> dict:
             "categories_available": bool(categories),
             "categories_as_of": category_source.get("as_of"),
             "rows_without_category": sum(1 for r in rows if r["category"] == NO_CATEGORY),
+            "ad_spend": {
+                **ad_summary,
+                "available": bool(ad_spend),
+                "days": AD_SPEND_DAYS,
+                "last_day": ad_spend.get("last_day"),
+            },
         },
     }
 

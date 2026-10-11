@@ -47,6 +47,19 @@ const STATUS = {
     fara_date: { label: 'Fără stoc în master', rank: 6, cls: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-700/60 dark:text-zinc-400' },
 }
 
+// Prioritate în reclame (ads_tiers.py pe server): ce împingem, pe ce lucrăm, ce frânăm.
+const TIERS = {
+    tractor: { label: 'Tractor', hint: 'se vinde bine și stocul ajunge — împinge', rank: 0, cls: 'bg-emerald-600 text-white dark:bg-emerald-500/80 dark:text-white', card: 'emerald' },
+    prea_mult: { label: 'Prea mult stoc', hint: 'se vinde, dar stocul ține peste 6 luni — de lucrat', rank: 1, cls: 'bg-orange-100 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300', card: 'orange' },
+    nu_se_vinde: { label: 'Nu se vinde', hint: `0 vânzări în ${CURRENT_DAYS} zile — de lucrat sau de lichidat`, rank: 2, cls: 'bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300', card: 'red' },
+    se_termina: { label: 'Se termină', hint: 'stoc sub 30 de zile — nu crește bugetul, comandă marfă', rank: 3, cls: 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300', card: 'blue' },
+    merge: { label: 'Merge', hint: 'se vinde normal — menține', rank: 4, cls: 'bg-zinc-100 text-zinc-700 dark:bg-zinc-700/60 dark:text-zinc-200', card: 'zinc' },
+    fara_stoc: { label: 'Fără stoc', hint: 'nimic de vândut — fără reclame', rank: 5, cls: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-700/60 dark:text-zinc-400', card: 'zinc' },
+    nejudecat: { label: 'Nejudecat', hint: 'prea nou, nelistat sau date incomplete', rank: 6, cls: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-700/60 dark:text-zinc-400', card: 'zinc' },
+}
+const TIER_ORDER = Object.keys(TIERS)
+const PLATFORM_LABEL = { meta: 'Meta', tiktok: 'TikTok', google: 'Google' }
+
 const VIEWS = [
     { key: 'toate', label: 'Toate', match: () => true },
     { key: 'mort', label: `Stoc mort (${DEAD_DAYS}+ zile)`, match: (r) => r.status === 'mort' },
@@ -139,6 +152,7 @@ const sinceSaleClass = (days) => {
 
 const sortValue = (r, key) => {
     if (key === 'status') return STATUS[r.status]?.rank ?? 9
+    if (key === 'ads_tier') return TIERS[r.ads_tier]?.rank ?? 9
     if (key === 'days_since_last_sale') return r.days_since_last_sale ?? Number.MAX_SAFE_INTEGER
     if (key === 'coverage_days') {
         if (r.stock == null || r.stock <= 0) return null
@@ -157,8 +171,27 @@ const compareRows = (a, b, key, dir) => {
     const cmp = typeof av === 'number' && typeof bv === 'number'
         ? (av - bv) * dir
         : String(av).localeCompare(String(bv), 'ro') * dir
-    if (cmp !== 0 || key !== 'status') return cmp
+    if (cmp !== 0 || (key !== 'status' && key !== 'ads_tier')) return cmp
+    // Within a tier: the stock worth working on first for the slow ones, the sellers for the rest.
+    if (key === 'ads_tier' && (a.ads_tier === 'tractor' || a.ads_tier === 'se_termina' || a.ads_tier === 'merge')) {
+        return (b.sold_units || 0) - (a.sold_units || 0)
+    }
     return (b.stock_value || 0) - (a.stock_value || 0)
+}
+
+function TierBadge({ tier }) {
+    const t = TIERS[tier]
+    if (!t) return <span className="text-zinc-400">—</span>
+    return <span title={t.hint} className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${t.cls}`}>{t.label}</span>
+}
+
+const spendTitle = (r) => {
+    const parts = Object.entries(r.ad_spend_platforms || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([p, v]) => `${PLATFORM_LABEL[p] || p}: ${formatMoney(v)} RON`)
+    const via = (r.ad_spend_via || []).filter((v) => v !== 'sku')
+    if (via.length) parts.push(`împărțit din ${via.join(', ')} după vânzările pe 90 de zile`)
+    return parts.join(' · ')
 }
 
 function StatusBadge({ status }) {
@@ -238,6 +271,7 @@ export default function StockCoverage() {
         () => (searchParams.get('categorii') || '').split(',').filter(Boolean),
         [searchParams],
     )
+    const selectedTier = TIERS[searchParams.get('nivel')] ? searchParams.get('nivel') : ''
 
     const [report, setReport] = useState(null)
     const [loading, setLoading] = useState(true)
@@ -330,11 +364,30 @@ export default function StockCoverage() {
     }, [productRows, selectedCategories])
 
     const rows = useMemo(() => {
-        const filtered = scopedRows.filter(view.match)
+        const filtered = scopedRows.filter((r) => view.match(r) && (!selectedTier || r.ads_tier === selectedTier))
         if (!sort.key || !sort.direction) return filtered
         const dir = sort.direction === 'asc' ? 1 : -1
         return [...filtered].sort((a, b) => compareRows(a, b, sort.key, dir))
-    }, [scopedRows, view, sort])
+    }, [scopedRows, view, sort, selectedTier])
+
+    // One row per product (a pooled store repeats the product's spend on every store row).
+    const tierSummary = useMemo(() => {
+        const byProduct = new Map()
+        scopedRows.forEach((r) => {
+            const key = productKey(r)
+            if (!byProduct.has(key) || r.store_uid === ALL_STORES) byProduct.set(key, r)
+        })
+        const agg = Object.fromEntries(TIER_ORDER.map((t) => [t, { products: 0, value: 0, spend: 0, signals: 0 }]))
+        byProduct.forEach((r) => {
+            const a = agg[r.ads_tier]
+            if (!a) return
+            a.products += 1
+            a.value += r.stock_value || 0
+            a.spend += r.ad_spend_30 || 0
+            if (r.ads_signal) a.signals += 1
+        })
+        return agg
+    }, [scopedRows])
 
     const kpis = useMemo(() => {
         const allWithStock = productsWithStock(scopedRows)
@@ -454,6 +507,34 @@ export default function StockCoverage() {
             ),
         },
         {
+            key: 'ads_tier', header: 'Prioritate reclame', sortable: true,
+            render: (r) => (
+                <div className="flex flex-col items-start gap-0.5">
+                    <TierBadge tier={r.ads_tier} />
+                    {r.ads_signal && (
+                        <span className="text-[11px] font-medium text-amber-700 dark:text-amber-300 max-w-56">{r.ads_signal}</span>
+                    )}
+                </div>
+            ),
+        },
+        {
+            key: 'ad_spend_30', header: `Reclame ${CURRENT_DAYS} zile`, sortable: true, align: 'right',
+            render: (r) => (
+                <div className="flex flex-col items-end" title={spendTitle(r) || undefined}>
+                    <span className={`font-mono whitespace-nowrap ${r.ad_spend_30 ? '' : 'text-zinc-400'}`}>
+                        {r.ad_spend_30 ? `${formatMoney(r.ad_spend_30)} RON` : '—'}
+                    </span>
+                    {(r.ad_spend_via || []).some((v) => v !== 'sku') && (
+                        <span className="text-[11px] text-zinc-500 dark:text-zinc-400 whitespace-nowrap">din grup de produse</span>
+                    )}
+                </div>
+            ),
+        },
+        {
+            key: 'ad_cost_per_unit', header: 'Reclamă / buc vândută', sortable: true, align: 'right',
+            render: (r) => <span className="font-mono whitespace-nowrap">{r.ad_cost_per_unit == null ? '—' : `${formatMoney(r.ad_cost_per_unit)} RON`}</span>,
+        },
+        {
             key: 'stock', header: 'Stoc', sortable: true, align: 'right',
             render: (r) => <span className="font-mono">{r.stock == null ? '—' : formatNumber(r.stock)}</span>,
         },
@@ -522,9 +603,10 @@ export default function StockCoverage() {
         },
     ]
 
-    const defaultVisible = ['expand', 'store_name', 'product_name', 'category', 'status', 'stock', 'sold_units', 'sold_units_90', 'days_since_last_sale', 'coverage_days', 'stock_value', 'surplus_value']
+    const defaultVisible = ['expand', 'store_name', 'product_name', 'category', 'status', 'ads_tier', 'ad_spend_30', 'stock', 'sold_units', 'sold_units_90', 'days_since_last_sale', 'coverage_days', 'stock_value', 'surplus_value']
+    // v5: adds the ads columns, which a saved v4 column choice would keep hidden.
     const { visibleKeys, setVisibleKeys, defaultVisibleKeys } =
-        useColumnVisibility('stock-coverage-v4', columns, defaultVisible)
+        useColumnVisibility('stock-coverage-v5', columns, defaultVisible)
     const tableColumns = columns.filter((c) => !c.hidden)
 
     const totals = useMemo(() => {
@@ -541,6 +623,7 @@ export default function StockCoverage() {
             surplus_units: sum('surplus_units', countsInSurplus),
             velocity: sum('velocity'),
             pool_sold_units: sum('pool_sold_units'),
+            ad_spend_30: [...new Map(rows.map((r) => [productKey(r), r.ad_spend_30 || 0])).values()].reduce((s, v) => s + v, 0),
         }
     }, [rows])
 
@@ -558,6 +641,7 @@ export default function StockCoverage() {
         ),
         velocity: () => <span className="font-mono font-semibold">{totals.velocity.toLocaleString('ro-RO', { maximumFractionDigits: 2 })}</span>,
         pool_sold_units: () => <span className="font-mono font-semibold">{formatNumber(totals.pool_sold_units)}</span>,
+        ad_spend_30: () => <span className="font-mono font-semibold whitespace-nowrap">{formatMoney(totals.ad_spend_30)} RON</span>,
     }
     const columnsWithTotal = tableColumns.map((c) => ({
         ...c,
@@ -579,6 +663,10 @@ export default function StockCoverage() {
         updateParams({ arata: key === 'toate' ? '' : key })
     }
     const handleSearchCommit = (text) => updateParams({ cauta: text.trim() })
+    const handleTierClick = (tier) => {
+        if (tier !== selectedTier) setSort({ key: 'ads_tier', direction: 'asc' })
+        updateParams({ nivel: tier === selectedTier ? '' : tier })
+    }
     const handleSortChange = (next) => {
         setSort(next)
         setPage(0)
@@ -606,6 +694,11 @@ export default function StockCoverage() {
                 'SKU': r.sku,
                 'Produs': r.product_name,
                 'Stare': STATUS[r.status]?.label || '',
+                'Prioritate reclame': TIERS[r.ads_tier]?.label || '',
+                'Semnal reclame': r.ads_signal || '',
+                [`Reclame ${CURRENT_DAYS} zile (RON)`]: r.ad_spend_30 || 0,
+                'Reclame: din grup de produse': (r.ad_spend_via || []).filter((v) => v !== 'sku').join(', '),
+                'Reclamă / buc vândută (RON)': r.ad_cost_per_unit ?? '',
                 'Stoc': r.stock ?? '',
                 'Stoc comun (toate magazinele)': r.stock_is_pool ? 'da' : '',
                 Categorie: r.category || '',
@@ -721,6 +814,42 @@ export default function StockCoverage() {
                     />
                 </div>
             </FilterBar>
+
+            <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 p-3">
+                <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+                    <h2 className="text-sm font-semibold text-zinc-900 dark:text-white">Prioritate în reclame</h2>
+                    <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                        {meta?.ad_spend?.available
+                            ? `Reclame Meta + TikTok + Google, ultimele ${meta.ad_spend.days} zile până la ${meta.ad_spend.last_day ? new Date(meta.ad_spend.last_day).toLocaleDateString('ro-RO') : '—'} · ${formatNumber(Math.round(meta.ad_spend.attributed))} din ${formatNumber(Math.round(meta.ad_spend.total))} RON legate de un produs (restul e pe brand sau cont, inclusiv parfumurile)`
+                            : 'Cheltuiala pe reclame nu e disponibilă acum — nivelurile se calculează doar din stoc și vânzări'}
+                    </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-7 gap-2">
+                    {TIER_ORDER.map((t) => {
+                        const a = tierSummary[t]
+                        const active = selectedTier === t
+                        return (
+                            <button
+                                key={t}
+                                type="button"
+                                onClick={() => handleTierClick(t)}
+                                data-action="filter-ads-tier"
+                                aria-pressed={active}
+                                className={`text-left rounded-lg border px-3 py-2 transition-colors ${active ? 'border-blue-500 ring-2 ring-blue-500/30 bg-blue-50 dark:bg-blue-950/40' : 'border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-700/30'}`}
+                            >
+                                <TierBadge tier={t} />
+                                <div className="mt-1.5 text-lg font-bold text-zinc-900 dark:text-white">{formatNumber(a.products)} <span className="text-xs font-normal text-zinc-500 dark:text-zinc-400">produse</span></div>
+                                <div className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-snug">
+                                    {t !== 'fara_stoc' && <div>stoc {formatNumber(Math.round(a.value))} RON</div>}
+                                    <div>reclame {formatNumber(Math.round(a.spend))} RON</div>
+                                    {a.signals > 0 && <div className="font-medium text-amber-700 dark:text-amber-300">{formatNumber(a.signals)} de verificat</div>}
+                                </div>
+                                <div className="mt-1 text-[11px] text-zinc-400 dark:text-zinc-500 leading-snug">{TIERS[t].hint}</div>
+                            </button>
+                        )
+                    })}
+                </div>
+            </div>
 
             <div className="grid grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6 gap-3">
                 <KpiCard
