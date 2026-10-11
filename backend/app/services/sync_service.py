@@ -28,6 +28,9 @@ Implementation notes:
 - COMPREHENSIVE LOGGING: per-store tracking, status changes, error grouping
 """
 
+import asyncio
+import contextlib
+import fcntl
 import logging
 import time
 from collections import defaultdict
@@ -82,6 +85,68 @@ INCREMENTAL_FALLBACK_DAYS = (
 )
 BATCH_SIZE = 100  # Save to database every N orders
 
+# Frisbo/Orqestra IGNORES the date filters on /orders/search (checked 11.10.2026:
+# updated_at_start / created_at_start return the same first page as no filter), so
+# every tier was paging through each org's ENTIRE history — ~860k orders and
+# ~490k requests a day, hence the 429s. Results do come newest-created first, so
+# each tier stops paging once a whole page was created before its floor. Status
+# changes on older orders are picked up by the wider tiers, as intended.
+CREATED_FLOOR_DAYS = {
+    "incremental": 3,
+    "recent_7d": RECENT_SYNC_DAYS,
+    "window_30d": WINDOW_SYNC_DAYS,
+    "recheck_30d": RECHECK_BY_CREATED_DAYS,
+    "deep_90d": DEEP_SYNC_DAYS,
+    "recheck_90d": RECHECK_BY_CREATED_DAYS_LONG,
+}
+# A page that fails (429, timeout) is retried, not skipped, after this many seconds × attempt.
+API_RETRY_DELAY_SECONDS = 5
+MAX_API_ERRORS = 5
+
+
+def _created_floor(sync_type: str, date_from: Optional[str]) -> Optional[datetime]:
+    days = CREATED_FLOOR_DAYS.get(sync_type)
+    if days:
+        return datetime.utcnow() - timedelta(days=days)
+    if sync_type == "custom" and date_from:
+        try:
+            return datetime.fromisoformat(date_from.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+    return None
+
+
+def _newest_created(orders: list) -> Optional[datetime]:
+    newest = None
+    for o in orders:
+        raw = (o.get("created_at") or "")[:19] if isinstance(o, dict) else ""
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None  # can't tell — keep paging
+        newest = dt if newest is None or dt > newest else newest
+    return newest
+
+
+@contextlib.contextmanager
+def _one_worker(sync_type: str):
+    """Yields False when another uvicorn worker already runs this tier: every worker
+    starts the scheduler, so each tier used to run twice at the same second."""
+    path = f"/tmp/awb-print-sync-{sync_type}.lock"
+    fh = open(path, "w")
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
 
 async def get_last_successful_sync_time() -> Optional[datetime]:
     """
@@ -121,6 +186,30 @@ async def get_last_successful_sync_time() -> Optional[datetime]:
 
 
 async def sync_orders(
+    sync_id: Optional[int] = None,
+    full_sync: bool = False,
+    sync_type: str = "window_30d",
+    store_uids: Optional[List[str]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """Scheduled runs (no sync_id) of a tier run in one worker only; manual runs from
+    the API come with a pre-created SyncLog row and always run."""
+    kwargs = dict(
+        sync_id=sync_id, full_sync=full_sync, sync_type=sync_type,
+        store_uids=store_uids, date_from=date_from, date_to=date_to,
+    )
+    if sync_id is not None:
+        return await _sync_orders(**kwargs)
+    canonical = SYNC_TYPE_ALIASES.get(sync_type, sync_type)
+    with _one_worker(canonical) as mine:
+        if not mine:
+            logger.info(f"📦 {canonical}: already running in the other worker — skipped")
+            return None
+        return await _sync_orders(**kwargs)
+
+
+async def _sync_orders(
     sync_id: Optional[int] = None,
     full_sync: bool = False,
     sync_type: str = "window_30d",
@@ -336,6 +425,10 @@ async def sync_orders(
             updated_count = 0
             skipped_count = 0
 
+            created_floor = _created_floor(sync_type, date_from)
+            if created_floor:
+                logger.info(f"📦 {sync_type}: paging stops at orders created before {created_floor:%Y-%m-%d %H:%M}")
+
             # ─── Pre-load known store UIDs for new store detection ───
             known_stores_result = await db.execute(select(Store.uid))
             known_store_uids = {row[0] for row in known_stores_result.fetchall()}
@@ -395,12 +488,13 @@ async def sync_orders(
                         error_groups[f"API:{error_type}"].append(
                             f"{org_name}@skip={skip}"
                         )
-                        if api_errors >= 3:
+                        if api_errors >= MAX_API_ERRORS:
                             logger.error(
-                                f"📦 [{org_name}] 3 consecutive API errors — abandoning org"
+                                f"📦 [{org_name}] {MAX_API_ERRORS} consecutive API errors — abandoning org"
                             )
                             break
-                        skip += BATCH_SIZE
+                        # Same page again: skipping it lost 100 orders per error.
+                        await asyncio.sleep(API_RETRY_DELAY_SECONDS * api_errors)
                         continue
 
                     api_errors = 0  # Reset on success
@@ -426,6 +520,13 @@ async def sync_orders(
                     if not orders_batch:
                         logger.info(
                             f"📦 [{org_name}] End of data at skip={skip}. Org total: {org_fetched}"
+                        )
+                        break
+
+                    newest = _newest_created(orders_batch) if created_floor else None
+                    if newest is not None and newest < created_floor:
+                        logger.info(
+                            f"📦 [{org_name}] Reached orders created before the {sync_type} floor at skip={skip}. Org total: {org_fetched}"
                         )
                         break
 

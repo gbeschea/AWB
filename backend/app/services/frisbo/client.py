@@ -4,7 +4,9 @@ Frisbo API Client — handles HTTP communication with the Frisbo Store-View API.
 Edit THIS file for API endpoint changes, request/response handling, and authentication.
 For data mapping changes, edit parser.py instead.
 """
+import asyncio
 import logging
+import random
 from typing import List, Optional, Dict, Any
 
 import httpx
@@ -17,6 +19,18 @@ from app.services.frisbo.parser import parse_order
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# One limiter per process: a client is created per org per sync, so per-client
+# limiters added up with no overall cap.
+_SHARED_LIMITER: Optional[RateLimiter] = None
+MAX_429_RETRIES = 4
+
+
+def _shared_limiter() -> RateLimiter:
+    global _SHARED_LIMITER
+    if _SHARED_LIMITER is None:
+        _SHARED_LIMITER = RateLimiter(settings.frisbo_rate_limit)
+    return _SHARED_LIMITER
+
 
 class FrisboClient:
     """Client for Frisbo Store-View API."""
@@ -25,13 +39,13 @@ class FrisboClient:
         self.base_url = settings.frisbo_api_url
         self.token = token or settings.frisbo_api_token
         self.org_name = org_name or "default"
-        self.rate_limiter = RateLimiter(settings.frisbo_rate_limit)
+        self.rate_limiter = _shared_limiter()
         
         # Log configuration on init
         logger.info("=" * 60)
         logger.info(f"FRISBO CLIENT INITIALIZED (org: {self.org_name})")
         logger.info(f"  Base URL: {self.base_url}")
-        logger.info(f"  Token: {self.token[:20]}...{self.token[-10:] if len(self.token) > 30 else self.token}")
+        # Never log any part of the token: the journal is readable by the awbdev group.
         logger.info(f"  Rate Limit: {settings.frisbo_rate_limit} req/sec")
         logger.info("=" * 60)
     
@@ -61,13 +75,22 @@ class FrisboClient:
         
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    params=params,
-                    json=json
-                )
+                for attempt in range(MAX_429_RETRIES + 1):
+                    response = await client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        params=params,
+                        json=json
+                    )
+                    if response.status_code != 429 or attempt == MAX_429_RETRIES:
+                        break
+                    retry_after = response.headers.get("Retry-After", "")
+                    delay = float(retry_after) if retry_after.replace(".", "", 1).isdigit() else 2 ** (attempt + 1)
+                    delay = min(delay, 60) * random.uniform(1.0, 1.3)
+                    logger.warning(f"⏳ 429 {endpoint} (org: {self.org_name}) — retry {attempt + 1} in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    await self.rate_limiter.acquire()
                 
                 # Parse response body
                 try:
